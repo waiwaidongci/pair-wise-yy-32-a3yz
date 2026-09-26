@@ -50,7 +50,7 @@ class Store:
         CREATE TABLE IF NOT EXISTS batches (
           id INTEGER PRIMARY KEY AUTOINCREMENT, factory_id INTEGER NOT NULL REFERENCES factories(id),
           batch_no TEXT NOT NULL, product TEXT NOT NULL, mfg_date TEXT NOT NULL, expiry_date TEXT NOT NULL,
-          state TEXT NOT NULL CHECK(state IN ('manufactured','investigation','awaiting_resample','conditional','released','rejected')),
+          state TEXT NOT NULL CHECK(state IN ('manufactured','investigation','awaiting_resample','conditional','released','rejected','recall_review','recalled')),
           revision INTEGER NOT NULL DEFAULT 1, created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
           UNIQUE(factory_id,batch_no)
         );
@@ -85,6 +85,21 @@ class Store:
           id INTEGER PRIMARY KEY AUTOINCREMENT, batch_id INTEGER NOT NULL REFERENCES batches(id), revision INTEGER NOT NULL,
           decision TEXT NOT NULL CHECK(decision IN ('release','reject','conditional','resample')), rationale TEXT NOT NULL,
           exception_code TEXT, decided_by TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(batch_id,revision)
+        );
+        CREATE TABLE IF NOT EXISTS quality_summaries (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, batch_id INTEGER NOT NULL REFERENCES batches(id),
+          version INTEGER NOT NULL, source TEXT NOT NULL CHECK(source IN ('release','supplement','recall_review')),
+          snapshot_json TEXT NOT NULL, note TEXT, created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+          UNIQUE(batch_id,version)
+        );
+        CREATE TABLE IF NOT EXISTS post_release_records (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, batch_id INTEGER NOT NULL REFERENCES batches(id),
+          data_type TEXT NOT NULL CHECK(data_type IN ('deviation','test','stability')), payload_json TEXT NOT NULL,
+          severity TEXT, passed INTEGER,
+          status TEXT NOT NULL CHECK(status IN ('pending','accepted','recall_review','closed')),
+          assessment TEXT, assessed_by TEXT, assessed_at TEXT,
+          conclusion TEXT, reviewed_by TEXT, reviewed_at TEXT,
+          created_by TEXT NOT NULL, created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS audit_log (
           id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL,
@@ -239,7 +254,8 @@ class BatchService:
         actor = self._actor(actor, role, {"qa"})
         batch = self._row("batches", batch_id)
         if decision not in {"release", "reject", "conditional", "resample"}: raise ApiError(400, "放行决定不合法")
-        if batch["state"] in {"released", "rejected"}: raise ApiError(409, "批次已经是终态")
+        if batch["state"] in {"released", "rejected", "recalled"}: raise ApiError(409, "批次已经是终态")
+        if batch["state"] == "recall_review": raise ApiError(409, "批次处于召回待审，请先完成复核")
         if int(expected_revision) != int(batch["revision"]): raise ApiError(409, "批次已被其他工厂或质量人员修改，请刷新版本")
         if not rationale.strip(): raise ApiError(400, "必须填写决定依据")
         deviations = self.conn.execute("SELECT * FROM deviations WHERE batch_id=? ORDER BY id", (batch_id,)).fetchall()
@@ -274,8 +290,119 @@ class BatchService:
             updated = self.conn.execute("UPDATE batches SET state=?,revision=revision+1,updated_at=? WHERE id=? AND revision=?",
                                         (new_state, now(), batch_id, expected_revision))
             if updated.rowcount != 1: raise ApiError(409, "并发放行冲突")
+            if new_state in {"released", "conditional"}:
+                self._create_summary(batch_id, "release", "放行质量摘要", actor)
             self.store.audit(actor, "batch.decision", "batch", batch_id, {"decision": decision, "revision": batch["revision"], "state": new_state, "exception_code": exception_code})
         return {"decision": dict(self._row("decisions", cur.lastrowid)), "batch": self.batch_detail(batch_id)["batch"]}
+
+    def submit_post_release(self, actor: str | None, role: str | None, factory_id: int, batch_id: int, data_type: str, payload: dict, expected_revision: int) -> dict:
+        actor = self._actor(actor, role, {"operator", "inspector", "lab"})
+        batch = self._row("batches", batch_id); self._factory_check(actor, factory_id, batch)
+        if batch["state"] not in {"released", "conditional", "recall_review"}: raise ApiError(409, "仅已放行批次可登记放行后补录数据")
+        severity, passed = self._validate_post_release(data_type, payload)
+        with self.conn:
+            cur = self.conn.execute("""INSERT INTO post_release_records(batch_id,data_type,payload_json,severity,passed,status,created_by,created_at)
+                                     VALUES(?,?,?,?,?,'pending',?,?)""",
+                                    (batch_id, data_type, j(payload), severity, passed, actor, now()))
+            self._advance_released_batch(batch_id, expected_revision, batch["state"])
+            self.store.audit(actor, "post_release.submit", "post_release", cur.lastrowid, {"batch_id": batch_id, "data_type": data_type, "severity": severity, "passed": passed})
+        return self._post_release_dict(self._row("post_release_records", cur.lastrowid))
+
+    @staticmethod
+    def _validate_post_release(data_type: str, payload: dict) -> tuple[str | None, int | None]:
+        if data_type == "deviation":
+            severity = str(payload.get("severity", ""))
+            if severity not in {"critical", "minor"} or not str(payload.get("title", "")).strip(): raise ApiError(400, "补录偏差等级或描述不合法")
+            return severity, None
+        if data_type == "test":
+            spec_min, spec_max, result = float(payload.get("spec_min", 0)), float(payload.get("spec_max", 0)), float(payload.get("result", 0))
+            if not str(payload.get("test_type", "")).strip() or spec_min > spec_max: raise ApiError(400, "补录检验项目或标准不合法")
+            return None, int(spec_min <= result <= spec_max)
+        if data_type == "stability":
+            spec_limit, result = float(payload.get("spec_limit", 0)), float(payload.get("result", 0))
+            if not str(payload.get("condition", "")).strip() or not str(payload.get("timepoint", "")).strip(): raise ApiError(400, "补录稳定性条件或时间点不合法")
+            return None, int(result <= spec_limit)
+        raise ApiError(400, "补录数据类型不合法")
+
+    def assess_post_release(self, actor: str | None, role: str | None, record_id: int, outcome: str, note: str, expected_revision: int) -> dict:
+        actor = self._actor(actor, role, {"qa"})
+        record = self._row("post_release_records", record_id); batch = self._row("batches", record["batch_id"])
+        if record["status"] != "pending": raise ApiError(409, "该补录记录已完成影响评估")
+        if outcome not in {"pass", "fail"}: raise ApiError(400, "影响评估结论不合法")
+        if not note.strip(): raise ApiError(400, "必须填写影响评估说明")
+        if outcome == "pass" and record["passed"] == 0: raise ApiError(409, "不合格数据不能作为补充证据，必须评估为不合格")
+        if outcome == "pass" and record["severity"] == "critical": raise ApiError(409, "关键偏差必须进入召回待审")
+        stamp = now()
+        with self.conn:
+            if outcome == "pass":
+                self.conn.execute("UPDATE post_release_records SET status='accepted',assessment=?,assessed_by=?,assessed_at=? WHERE id=? AND status='pending'",
+                                  (note, actor, stamp, record_id))
+                self._advance_released_batch(batch["id"], expected_revision, batch["state"])
+                self._create_summary(batch["id"], "supplement", f"放行后补充证据（记录 {record_id}）：{note}", actor)
+            else:
+                self.conn.execute("UPDATE post_release_records SET status='recall_review',assessment=?,assessed_by=?,assessed_at=? WHERE id=? AND status='pending'",
+                                  (note, actor, stamp, record_id))
+                self._advance_released_batch(batch["id"], expected_revision, "recall_review")
+            self.store.audit(actor, "post_release.assess", "post_release", record_id, {"batch_id": batch["id"], "outcome": outcome, "note": note})
+        return {"record": self._post_release_dict(self._row("post_release_records", record_id)), "batch": self.batch_detail(batch["id"])["batch"]}
+
+    def review_recall(self, actor: str | None, role: str | None, batch_id: int, outcome: str, conclusion: str, expected_revision: int) -> dict:
+        actor = self._actor(actor, role, {"qa"})
+        batch = self._row("batches", batch_id)
+        if batch["state"] != "recall_review": raise ApiError(409, "批次不在召回待审状态")
+        if outcome not in {"recall", "clear"}: raise ApiError(400, "复核结论不合法")
+        if not conclusion.strip(): raise ApiError(400, "必须填写复核结论")
+        new_state, stamp = ("recalled" if outcome == "recall" else "released"), now()
+        with self.conn:
+            self.conn.execute("""UPDATE post_release_records SET status='closed',conclusion=?,reviewed_by=?,reviewed_at=?
+                               WHERE batch_id=? AND status='recall_review'""", (conclusion, actor, stamp, batch_id))
+            self._advance_released_batch(batch_id, expected_revision, new_state)
+            self._create_summary(batch_id, "recall_review", f"召回待审复核：{conclusion}", actor)
+            self.store.audit(actor, "batch.recall_review", "batch", batch_id, {"outcome": outcome, "state": new_state, "conclusion": conclusion})
+        return {"batch": self.batch_detail(batch_id)["batch"], "state": new_state}
+
+    def _advance_released_batch(self, batch_id: int, expected_revision: int, next_state: str) -> None:
+        batch = self._row("batches", batch_id)
+        if batch["state"] not in {"released", "conditional", "recall_review"}: raise ApiError(409, "批次状态不允许放行后操作")
+        if int(expected_revision) != int(batch["revision"]): raise ApiError(409, "批次版本冲突")
+        cur = self.conn.execute("UPDATE batches SET state=?,revision=revision+1,updated_at=? WHERE id=? AND revision=?",
+                                (next_state, now(), batch_id, expected_revision))
+        if cur.rowcount != 1: raise ApiError(409, "并发更新冲突")
+
+    def _snapshot(self, batch_id: int) -> dict:
+        def rows(name: str) -> list[dict]: return [dict(row) for row in self.conn.execute(f"SELECT * FROM {name} WHERE batch_id=? ORDER BY id", (batch_id,))]
+        return {"batch": self._batch_dict(self._row("batches", batch_id)), "deviations": rows("deviations"), "tests": rows("tests"),
+                "rework": rows("rework"), "supplier_changes": rows("supplier_changes"), "stability": rows("stability"),
+                "decisions": rows("decisions"),
+                "supplementary_evidence": [self._post_release_dict(row) for row in self.conn.execute(
+                    "SELECT * FROM post_release_records WHERE batch_id=? AND status IN ('accepted','closed') ORDER BY id", (batch_id,))]}
+
+    def _create_summary(self, batch_id: int, source: str, note: str, actor: str) -> int:
+        version = self.conn.execute("SELECT COALESCE(MAX(version),0)+1 FROM quality_summaries WHERE batch_id=?", (batch_id,)).fetchone()[0]
+        self.conn.execute("INSERT INTO quality_summaries(batch_id,version,source,snapshot_json,note,created_by,created_at) VALUES(?,?,?,?,?,?,?)",
+                          (batch_id, version, source, j(self._snapshot(batch_id)), note, actor, now()))
+        return version
+
+    def summaries(self, batch_id: int) -> list[dict]:
+        self._row("batches", batch_id)
+        return [self._summary_dict(row) for row in self.conn.execute("SELECT * FROM quality_summaries WHERE batch_id=? ORDER BY version", (batch_id,))]
+
+    def pending_post_release(self) -> list[dict]:
+        return [self._post_release_dict(row) for row in self.conn.execute(
+            "SELECT * FROM post_release_records WHERE status IN ('pending','recall_review') ORDER BY id")]
+
+    @staticmethod
+    def _summary_dict(row: sqlite3.Row) -> dict:
+        return {"id": row["id"], "batch_id": row["batch_id"], "version": row["version"], "source": row["source"],
+                "note": row["note"], "snapshot": json.loads(row["snapshot_json"]), "created_by": row["created_by"], "created_at": row["created_at"]}
+
+    @staticmethod
+    def _post_release_dict(row: sqlite3.Row) -> dict:
+        return {"id": row["id"], "batch_id": row["batch_id"], "data_type": row["data_type"], "payload": json.loads(row["payload_json"]),
+                "severity": row["severity"], "passed": None if row["passed"] is None else bool(row["passed"]), "status": row["status"],
+                "assessment": row["assessment"], "assessed_by": row["assessed_by"], "assessed_at": row["assessed_at"],
+                "conclusion": row["conclusion"], "reviewed_by": row["reviewed_by"], "reviewed_at": row["reviewed_at"],
+                "created_by": row["created_by"], "created_at": row["created_at"]}
 
     def _advance_batch(self, batch_id: int, expected_revision: int, next_state: str) -> None:
         batch = self._row("batches", batch_id)
@@ -290,7 +417,9 @@ class BatchService:
         def rows(name: str) -> list[dict]: return [dict(row) for row in self.conn.execute(f"SELECT * FROM {name} WHERE batch_id=? ORDER BY id", (batch_id,))]
         return {"batch": batch, "deviations": rows("deviations"), "tests": rows("tests"), "rework": rows("rework"),
                 "supplier_changes": rows("supplier_changes"), "stability": rows("stability"),
-                "decisions": rows("decisions")}
+                "decisions": rows("decisions"), "summaries": self.summaries(batch_id),
+                "post_release": [self._post_release_dict(row) for row in self.conn.execute(
+                    "SELECT * FROM post_release_records WHERE batch_id=? ORDER BY id", (batch_id,))]}
 
     def _batch_dict(self, row: sqlite3.Row) -> dict:
         return {"id": row["id"], "factory_id": row["factory_id"], "batch_no": row["batch_no"], "product": row["product"],
@@ -310,6 +439,7 @@ class BatchService:
     def state(self) -> dict:
         return {"factories": [dict(row) for row in self.conn.execute("SELECT * FROM factories ORDER BY id")],
                 "batches": [self._batch_dict(row) for row in self.conn.execute("SELECT * FROM batches ORDER BY id DESC")],
+                "post_release_pending": self.pending_post_release(),
                 "audits": [dict(row) for row in self.conn.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT 30")]}
 
     def seed(self) -> None:
@@ -334,6 +464,8 @@ class Handler(BaseHTTPRequestHandler):
             p = self._parts()
             if p in (["health"], ["api", "health"]): out = {"status": "ok"}
             elif p == ["api", "state"]: out = self.service.state()
+            elif p == ["api", "post-release", "pending"]: out = {"pending": self.service.pending_post_release()}
+            elif len(p) == 4 and p[:2] == ["api", "batches"] and p[3] == "summaries": out = {"summaries": self.service.summaries(int(p[2]))}
             elif len(p) == 3 and p[:2] == ["api", "batches"]: out = self.service.batch_detail(int(p[2]))
             elif not p:
                 page = (Path(__file__).parent / "static" / "index.html").read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(page))); self.end_headers(); self.wfile.write(page); return
@@ -356,6 +488,9 @@ class Handler(BaseHTTPRequestHandler):
             elif len(p) == 4 and p[:2] == ["api", "batches"] and p[3] == "supplier-changes": out = self.service.record_supplier_change(actor, role, int(b.get("factory_id", 0)), int(p[2]), b.get("supplier", ""), b.get("change_type", ""), b.get("description", ""), int(b.get("expected_revision", -1)))
             elif len(p) == 4 and p[:2] == ["api", "batches"] and p[3] == "stability": out = self.service.record_stability(actor, role, int(b.get("factory_id", 0)), int(p[2]), b.get("condition", ""), b.get("timepoint", ""), float(b.get("result", 0)), float(b.get("spec_limit", 0)), int(b.get("expected_revision", -1)))
             elif len(p) == 4 and p[:2] == ["api", "batches"] and p[3] == "decide": out = self.service.decide(actor, role, int(p[2]), b.get("decision", ""), b.get("rationale", ""), int(b.get("expected_revision", -1)), b.get("exception_code", ""))
+            elif len(p) == 4 and p[:2] == ["api", "batches"] and p[3] == "post-release": out = self.service.submit_post_release(actor, role, int(b.get("factory_id", 0)), int(p[2]), b.get("data_type", ""), b.get("payload") or {}, int(b.get("expected_revision", -1)))
+            elif len(p) == 4 and p[:2] == ["api", "post-release"] and p[3] == "assess": out = self.service.assess_post_release(actor, role, int(p[2]), b.get("outcome", ""), b.get("note", ""), int(b.get("expected_revision", -1)))
+            elif len(p) == 4 and p[:2] == ["api", "batches"] and p[3] == "recall-review": out = self.service.review_recall(actor, role, int(p[2]), b.get("outcome", ""), b.get("conclusion", ""), int(b.get("expected_revision", -1)))
             else: raise ApiError(404, "接口不存在")
             self._send(200, out)
         except ApiError as exc: self._send(exc.status, {"error": exc.message})
