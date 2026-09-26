@@ -19,8 +19,12 @@ python3 app.py
 - `POST /api/batches/{id}/tests`：记录检验和复测轮次。
 - `POST /api/batches/{id}/rework`、`POST /api/rework/{id}/complete`：计划和完成返工。
 - `POST /api/batches/{id}/supplier-changes`、`POST /api/batches/{id}/stability`：关联供应链和稳定性记录。
-- `POST /api/batches/{id}/decide`：质量决定，支持并发修订号检查。
-- `GET /api/batches/{id}`、`GET /api/state`、`GET /api/health`：详情、状态和健康检查。
+- `POST /api/batches/{id}/decide`：质量决定，支持并发修订号检查；放行或有条件放行时自动生成第一版质量摘要。
+- `POST /api/batches/{id}/post-release`：已放行批次补录偏差、检验或稳定性数据，进入待评估。
+- `POST /api/post-release/{id}/assess`：质量影响评估。合格数据作为放行后补充证据并生成新摘要版本；不合格数据或关键偏差（即使评估人认为可接受）使批次进入召回待审。
+- `POST /api/batches/{id}/recall-review`：召回复核，`decision` 为 `recall`（确认召回）或 `clear`（解除待审并恢复原放行状态），结论写入摘要新版本。
+- `GET /api/batches/{id}/summary`：查看质量摘要版本、补录事项、待审事项和处理结论；原放行决定始终保留在批次详情中供追溯。
+- `GET /api/batches/{id}`、`GET /api/state`、`GET /api/health`：详情、状态（含待审队列）和健康检查。
 
 ## 测试
 
